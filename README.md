@@ -8,3 +8,8 @@ My goal is to start with the tensor cores. Try to get a nice, scalable way to ru
 
 Later, I will deal with memory access. From what I've read, I suspect people who actually write kernels for a living would start with this because for them, when the data's in the right place compute is trivial. For now I don't know what the access patterns are going to be yet, and I want to set up a good workflow to profile sufficiently intense compute so that bad scheduling visibly makes it run worse.
 
+
+## Next steps:
+
+- codegen fragment logic
+- support larger matrix by tiling MMAs
