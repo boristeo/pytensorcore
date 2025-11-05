@@ -11,6 +11,8 @@ from cuda.core.experimental import (
     ProgramOptions,
     launch,
 )
+from functools import reduce
+import operator
 
 if np.__version__ < "2.1.0":
     print("This example requires NumPy 2.1.0 or later", file=sys.stderr)
@@ -29,7 +31,64 @@ BLOCK_SIZE = 32  # single warp
 # Fragment definitions
 # ======================================================================================
 
-# TODO:
+# Multiplicand A:
+#
+# groupID           = %laneid >> 2
+# threadID_in_group = %laneid % 4
+# 
+# row =      groupID            for ai where  0 <= i < 2 || 4 <= i < 6
+#           groupID + 8         Otherwise
+# 
+# col =  (threadID_in_group * 2) + (i & 0x1)          for ai where i <  4
+# (threadID_in_group * 2) + (i & 0x1) + 8      for ai where i >= 4
+
+
+# Description of the access pattern as a strided multidim array. Format TBD
+
+esize = 2
+regs = 8
+shape = [M//2, K//4, 2, 2, 2]
+strides = [M, 2, K//2, K*M//2, 1]
+
+# 
+
+print(reduce(operator.mul, shape, 1))
+assert reduce(operator.mul, shape, 1) == M * K, 'Matrix view does not cover all elements'
+assert shape[-1] >= 4 // esize, 'Misaligned accesses in view'
+if 4 // esize > 1:
+  assert strides[-1] == 1, 'Misaligned accesses in view'
+  shape[-1] //= (4 // esize)
+  regs //= (4 // esize)
+
+indexes = []
+index = [0] * len(shape)
+for i in range(regs):
+  indexes.append(sum(a * b for a, b in zip(index, strides)))
+  index[-1] += 1
+  for j in range(len(index))[::-1]:
+    if index[j] < shape[j]:
+      break
+    index[j] = 0
+    index[j-1] += 1
+
+print(indexes)
+
+elements = 1
+for i, dim in list(enumerate(shape))[::-1]:
+  elements *= dim
+  if elements == regs:
+    break
+
+print(shape[:i], strides[:i])
+
+mat_type = 'half2'
+mat_name = 'A'
+
+# TODO: how to do nice lane offset calculation?
+code_lane_a = f'unsigned int lane_offset = lane_id / 4 * 16 + lane_id % 4 * 2;\n'
+code_load_a = code_lane_a + f'{mat_type} {mat_name.lower()}_frag[{regs}];\n'+'\n'.join((f'{mat_name.lower()}_frag[{i}] = __halves2half2({mat_name}[{indexes[i]} + lane_offset], {mat_name}[{indexes[i]} + 1 + lane_offset]);' for i in range(regs)))
+
+
 
 # ======================================================================================
 # CUDA kernel for FP16 matrix multiplication with FP32 accumulation
@@ -46,29 +105,10 @@ code_setup = f'''
     float d_frag[4];
 
     // MMA expects 2 half per 32b register (half2), so there are 4 half2 for A, 2 for B
-    half2 a_frag[4];
     half2 b_frag[2];
-'''
+''' 
 
-code_load = f'''
-    // --- Fill A fragment (4 regs, 2 half each) ---
-    for (int frag = 0; frag < 4; ++frag) {{
-        // For each half in this half2
-        half h0, h1;
-        for (int subidx = 0; subidx < 2; ++subidx) {{
-            int ai = frag * 2 + subidx;
-            unsigned int row = ( (ai < 2) || (ai >= 4 && ai < 6) ) ? groupID : (groupID + 8);
-            unsigned int col = (threadID_in_group * 2) + (ai & 1);
-            if (ai >= 4) col += 8;
-            int index = row * {K} + col;
-            half value = __float2half(0.0f);
-            if(row < {M} && col < {K})
-                value = A[index];
-            if(subidx == 0) h0 = value;
-            else h1 = value;
-        }}
-        a_frag[frag] = __halves2half2(h0, h1);
-    }}
+code_load = code_load_a + f'''
 
     // --- Fill B fragment (2 regs, 2 half each) ---
     for (int frag = 0; frag < 2; ++frag) {{
