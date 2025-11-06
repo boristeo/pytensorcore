@@ -45,126 +45,107 @@ BLOCK_SIZE = 32  # single warp
 
 # Description of the access pattern as a strided multidim array. Format TBD
 
-esize = 2
-regs = 8
-shape = [M//2, K//4, 2, 2, 2]
-strides = [M, 2, K//2, K*M//2, 1]
+class StridedIndexMapper:
+  def __init__(self, shape, strides):
+      self.shape = shape
+      self.strides = strides
 
-# 
+  def logical_to_real(self, idx):
+      coords = []
+      for dim in reversed(self.shape):
+          coords.append(idx % dim)
+          idx //= dim
+      coords.reverse()
+      return sum(c * s for c, s in zip(coords, self.strides))
 
-print(reduce(operator.mul, shape, 1))
-assert reduce(operator.mul, shape, 1) == M * K, 'Matrix view does not cover all elements'
-assert shape[-1] >= 4 // esize, 'Misaligned accesses in view'
-if 4 // esize > 1:
-  assert strides[-1] == 1, 'Misaligned accesses in view'
-  shape[-1] //= (4 // esize)
-  regs //= (4 // esize)
+  def export_c_expression(self, idx_name="idx"):
+    terms = []
+    cumprod = 1
+    for dim, stride in zip(reversed(self.shape), reversed(self.strides)):
+        term = f"(({idx_name} / {cumprod}) % {dim}) * {stride}"
+        terms.append(term)
+        cumprod *= dim
+    terms.reverse()
+    return " + ".join(terms)
 
-indexes = []
-index = [0] * len(shape)
-for i in range(regs):
-  indexes.append(sum(a * b for a, b in zip(index, strides)))
-  index[-1] += 1
-  for j in range(len(index))[::-1]:
-    if index[j] < shape[j]:
-      break
-    index[j] = 0
-    index[j-1] += 1
+class Fragments:
+  def __init__(self, name, lshape, dtype, esize, nregs, fshape, fstrides):
+    self.name = name
+    self.lshape = lshape
+    self.dtype = dtype
+    self.esize = esize
+    self.nregs = nregs
+    assert reduce(operator.mul, fshape, 1) == reduce(operator.mul, lshape, 1), 'Matrix view does not cover all elements'
+    assert fshape[-1] >= 4 // esize, 'Misaligned accesses in view'
+    # Merge < 4 byte loads into 4 byte loads
+    #if 4 // esize > 1:
+    #  assert fstrides[-1] == 1, 'Misaligned accesses in view'
+    #  fshape[-1] //= (4 // esize)
+    #  nregs //= (4 // esize)
 
-print(indexes)
+    # Go from the right, find the dimension at which all registers are indexable
+    elements = 1
+    for i, dim in list(enumerate(fshape))[::-1]:
+      elements *= dim
+      if elements >= nregs:
+        assert elements == nregs, 'Lanes should index starting at a new dimension'
+        break
+    self.lanes = StridedIndexMapper(fshape[:i], fstrides[:i])
+    self.regs = StridedIndexMapper(fshape[i:], fstrides[i:])
 
-elements = 1
-for i, dim in list(enumerate(shape))[::-1]:
-  elements *= dim
-  if elements == regs:
-    break
 
-print(shape[:i], strides[:i])
+  def linidx(self, lane, reg):
+    return self.lanes.logical_to_real(lane) + self.regs.logical_to_real(reg)
 
-mat_type = 'half2'
-mat_name = 'A'
+    
 
-# TODO: how to do nice lane offset calculation?
-code_lane_a = f'unsigned int lane_offset = lane_id / 4 * 16 + lane_id % 4 * 2;\n'
-code_load_a = code_lane_a + f'{mat_type} {mat_name.lower()}_frag[{regs}];\n'+'\n'.join((f'{mat_name.lower()}_frag[{i}] = __halves2half2({mat_name}[{indexes[i]} + lane_offset], {mat_name}[{indexes[i]} + 1 + lane_offset]);' for i in range(regs)))
-
+a_frags = Fragments('A', (M, K), 'half', 2, 8, [M//2, K//4, 2, 2, 2], [M, 2, K//2, M*K//2, 1])
+b_frags = Fragments('B', (K, N), 'half', 2, 4, [N, K//4, 2, 2], [1, 2*N, K*N//2, N])
+d_frags = Fragments('D', (M, N), 'float', 4, 4, [8, 4, 2, 2], [N, 2, M*N//2, 1])
 
 
 # ======================================================================================
 # CUDA kernel for FP16 matrix multiplication with FP32 accumulation
 # ======================================================================================
-code_setup = f'''
-    // Lane and group assignment within the warp
-    unsigned int lane_id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-    unsigned int groupID = lane_id >> 2;
-    unsigned int threadID_in_group = lane_id & 3;
-
-    // Output accumulator fragments (FP32)
-    float c_frag[4] = {{0.f, 0.f, 0.f, 0.f}};
-    float d_frag[4];
-
-    // MMA expects 2 half per 32b register (half2), so there are 4 half2 for A, 2 for B
-    half2 b_frag[2];
-''' 
-
-code_load = code_load_a + f'''
-
-    // --- Fill B fragment (2 regs, 2 half each) ---
-    for (int frag = 0; frag < 2; ++frag) {{
-        half h0, h1;
-        for (int subidx = 0; subidx < 2; ++subidx) {{
-            int bi = frag * 2 + subidx;
-            unsigned int row = (threadID_in_group * 2) + (bi & 1);
-            if (bi >= 2) row += 8;
-            unsigned int col = groupID;
-            int index = row * {N} + col;
-            half value = __float2half(0.0f);
-            if(row < {K} && col < {N})
-                value = B[index];
-            if(subidx == 0) h0 = value;
-            else h1 = value;
-        }}
-        b_frag[frag] = __halves2half2(h0, h1);
-    }}
-
-    // Cast to unsigned for inline PTX
-    unsigned int a_int[4], b_int[2];
-    #pragma unroll
-    for(int i = 0; i < 4; ++i)
-        a_int[i] = reinterpret_cast<unsigned int &>(a_frag[i]);
-    #pragma unroll
-    for(int i = 0; i < 2; ++i)
-        b_int[i] = reinterpret_cast<unsigned int &>(b_frag[i]);
-'''
+def code_load(mat_frags):
+  return f'''
+    unsigned int {mat_frags.name.lower()}_lane_offset = {mat_frags.lanes.export_c_expression("lane_id")};
+    {mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}];
+    {'\n    '.join((
+      f'{mat_frags.name.lower()}_frag[{i}] = {mat_frags.name}[{mat_frags.name.lower()}_lane_offset + {mat_frags.linidx(0, i)}];'
+      for i in range(mat_frags.nregs)))}
+    unsigned int* {mat_frags.name.lower()}_int = reinterpret_cast<unsigned int *>({mat_frags.name.lower()}_frag);
+  '''
 
 code_exec = f'''
+    float c_frag[4] = {{0.f, 0.f, 0.f, 0.f}};
+    float d_frag[4];
     // --- MMA PTX ---
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%0, %1, %2, %3}},{{%4, %5, %6, %7}},{{%8, %9}},{{%10, %11, %12, %13}};\\n"
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%0,%1,%2,%3}},{{%4,%5,%6,%7}},{{%8,%9}},{{%10,%11,%12,%13}};\\n"
         : "=f"(d_frag[0]), "=f"(d_frag[1]), "=f"(d_frag[2]), "=f"(d_frag[3])
-        : "r"(a_int[0]), "r"(a_int[1]), "r"(a_int[2]), "r"(a_int[3]), "r"(b_int[0]), "r"(b_int[1]), "f"(c_frag[0]), "f"(c_frag[1]), "f"(c_frag[2]), "f"(c_frag[3])
+        : "r"(a_int[0]), "r"(a_int[1]), "r"(a_int[2]), "r"(a_int[3]),
+        "r"(b_int[0]), "r"(b_int[1]),
+        "f"(c_frag[0]), "f"(c_frag[1]), "f"(c_frag[2]), "f"(c_frag[3])
     );
 '''
 
-code_store = f'''
-    // --- Write results by fragment-to-tile mapping ---
-    for (int i = 0; i < 4; i++) {{
-        unsigned int row = (i < 2) ? groupID : (groupID + 8);
-        unsigned int col = (threadID_in_group * 2) + (i & 1);
-        if (row < {M} && col < {N}) {{
-            unsigned int idx = row * {N} + col;
-            D[idx] = d_frag[i];
-        }}
-    }}
-'''
+def code_store(mat_frags):
+  return f'''
+    unsigned int {mat_frags.name.lower()}_lane_offset = {mat_frags.lanes.export_c_expression("lane_id")};
+    {'\n    '.join((
+      f'{mat_frags.name}[{mat_frags.name.lower()}_lane_offset + {mat_frags.linidx(0, i)}] = {mat_frags.name.lower()}_frag[{i}];'
+      for i in range(mat_frags.nregs)))}
+  '''
 
 code = f'''extern "C"
 __global__ void matmul_fp16_fp32(const half* A, const half* B, float* C, float* D) {{
-  {code_setup}
-  {code_load}
-  {code_exec}
-  {code_store}
+    unsigned int lane_id;
+    asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
+    {code_load(a_frags)}
+    {code_load(b_frags)}
+    {code_exec}
+    {code_store(d_frags)}
 }}
 '''
 
