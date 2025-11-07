@@ -31,6 +31,15 @@ BLOCK_SIZE = 32  # single warp
 # Fragment definitions
 # ======================================================================================
 
+class Fragments:
+  def __init__(self, name, lshape, dtype, esize, nregs, locs):
+    self.name = name
+    self.lshape = lshape
+    self.dtype = dtype
+    self.esize = esize
+    self.nregs = nregs
+    self.locs = (f'({h})*{lshape[-1]}+({c})' for h, c in locs)
+
 # Multiplicand A:
 #
 # groupID           = %laneid >> 2
@@ -42,96 +51,24 @@ BLOCK_SIZE = 32  # single warp
 # col =  (threadID_in_group * 2) + (i & 0x1)          for ai where i <  4
 # (threadID_in_group * 2) + (i & 0x1) + 8      for ai where i >= 4
 
-
-# Description of the access pattern as a strided multidim array. Format TBD
-
-class StridedIndexMapper:
-  def __init__(self, shape, strides):
-      self.shape = shape
-      self.strides = strides
-
-  def logical_to_real(self, idx):
-      coords = []
-      for dim in reversed(self.shape):
-          coords.append(idx % dim)
-          idx //= dim
-      coords.reverse()
-      return sum(c * s for c, s in zip(coords, self.strides))
-
-  def export_c_expression(self, idx_name="idx"):
-    terms = []
-    cumprod = 1
-    for dim, stride in zip(reversed(self.shape), reversed(self.strides)):
-        term = f"(({idx_name} / {cumprod}) % {dim}) * {stride}"
-        terms.append(term)
-        cumprod *= dim
-    terms.reverse()
-    return " + ".join(terms)
-
-class Fragments:
-  def __init__(self, name, lshape, dtype, esize, nregs, fshape, fstrides):
-    self.name = name
-    self.lshape = lshape
-    self.dtype = dtype
-    self.esize = esize
-    self.nregs = nregs
-    assert reduce(operator.mul, fshape, 1) == reduce(operator.mul, lshape, 1), 'Matrix view does not cover all elements'
-    assert fshape[-1] >= 4 // esize, 'Misaligned accesses in view'
-    # Merge < 4 byte loads into 4 byte loads
-    #if 4 // esize > 1:
-    #  assert fstrides[-1] == 1, 'Misaligned accesses in view'
-    #  fshape[-1] //= (4 // esize)
-    #  nregs //= (4 // esize)
-
-    # Go from the right, find the dimension at which all registers are indexable
-    elements = 1
-    for i, dim in list(enumerate(fshape))[::-1]:
-      elements *= dim
-      if elements >= nregs:
-        assert elements == nregs, 'Lanes should index starting at a new dimension'
-        break
-    self.lanes = StridedIndexMapper(fshape[:i], fstrides[:i])
-    self.regs = StridedIndexMapper(fshape[i:], fstrides[i:])
-
-
-  def linidx(self, lane, reg):
-    return self.lanes.logical_to_real(lane) + self.regs.logical_to_real(reg)
-
-
+# TODO: Clean up syntax to specify these
 a_locs = [(f'{(i//2%2)*M//2}+(lane_id/4)', f'{(i%2)+(i//4%2)*M//2}+(lane_id%4)*2') for i in range(8)]
-a_shape = (M, K)
-a_locs_flat = (f'({h})*{a_shape[-1]}+({c})' for h, c in a_locs)
+a_frags = Fragments('A', (M, K), 'half', 2, 8, a_locs)
 
 b_locs = [(f'{(i%2)+(i//2)*K//2}+(lane_id%4)*2', f'lane_id/4') for i in range(4)]
-b_shape = (K, N)
-b_locs_flat = (f'({h})*{b_shape[-1]}+({c})' for h, c in b_locs)
+b_frags = Fragments('B', (K, N), 'half', 2, 4, b_locs)
 
 d_locs = [(f'{(i//2)*(M//2)}+(lane_id/4)', f'{i%2}+(lane_id%4)*2') for i in range(4)]
-d_shape = (M, N)
-d_locs_flat = (f'({h})*{b_shape[-1]}+({c})' for h, c in d_locs)
-
-a_frags = Fragments('A', (M, K), 'half', 2, 8, [M//2, K//4, 2, 2, 2], [M, 2, K//2, M*K//2, 1])
-b_frags = Fragments('B', (K, N), 'half', 2, 4, [N, K//4, 2, 2], [1, 2*N, K*N//2, N])
-d_frags = Fragments('D', (M, N), 'float', 4, 4, [8, 4, 2, 2], [N, 2, M*N//2, 1])
+d_frags = Fragments('D', (M, N), 'float', 4, 4, d_locs)
 
 
 # ======================================================================================
 # CUDA kernel for FP16 matrix multiplication with FP32 accumulation
 # ======================================================================================
-def code_load(mat_frags):
-  return f'''
-    unsigned int {mat_frags.name.lower()}_lane_offset = {mat_frags.lanes.export_c_expression("lane_id")};
-    {mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}];
-    {'\n    '.join((
-      f'{mat_frags.name.lower()}_frag[{i}] = {mat_frags.name}[{mat_frags.name.lower()}_lane_offset + {mat_frags.linidx(0, i)}];'
-      for i in range(mat_frags.nregs)))}
-    unsigned int* {mat_frags.name.lower()}_int = reinterpret_cast<unsigned int *>({mat_frags.name.lower()}_frag);
-  '''
-
-def code_load_v2(locs, mat_frags):
+def code_load_v2(mat_frags):
   return f'''
     {mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}] {{
-      {',\n      '.join((f'{mat_frags.name}[{loc}]' for i, loc in enumerate(locs)))}
+      {',\n      '.join((f'{mat_frags.name}[{loc}]' for i, loc in enumerate(mat_frags.locs)))}
     }};
     unsigned int* {mat_frags.name.lower()}_int = reinterpret_cast<unsigned int *>({mat_frags.name.lower()}_frag);
   '''
@@ -149,28 +86,19 @@ code_exec = f'''
     );
 '''
 
-def code_store(mat_frags):
+def code_store_v2(mat_frags):
   return f'''
-    unsigned int {mat_frags.name.lower()}_lane_offset = {mat_frags.lanes.export_c_expression("lane_id")};
-    {'\n    '.join((
-      f'{mat_frags.name}[{mat_frags.name.lower()}_lane_offset + {mat_frags.linidx(0, i)}] = {mat_frags.name.lower()}_frag[{i}];'
-      for i in range(mat_frags.nregs)))}
-  '''
-
-def code_store_v2(locs, mat_frags):
-  return f'''
-    unsigned int {mat_frags.name.lower()}_lane_offset = {mat_frags.lanes.export_c_expression("lane_id")};
-    {'\n    '.join((f'{mat_frags.name}[{loc}] = {mat_frags.name.lower()}_frag[{i}];' for i, loc in enumerate(locs)))}
+    {'\n    '.join((f'{mat_frags.name}[{loc}] = {mat_frags.name.lower()}_frag[{i}];' for i, loc in enumerate(mat_frags.locs)))}
   '''
 
 code = f'''extern "C"
 __global__ void matmul_fp16_fp32(const half* A, const half* B, float* C, float* D) {{
     unsigned int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-    {code_load_v2(a_locs_flat, a_frags)}
-    {code_load_v2(b_locs_flat, b_frags)}
+    {code_load_v2(a_frags)}
+    {code_load_v2(b_frags)}
     {code_exec}
-    {code_store_v2(d_locs_flat, d_frags)}
+    {code_store_v2(d_frags)}
 }}
 '''
 
