@@ -23,7 +23,7 @@ if np.__version__ < "2.1.0":
 # Matrix dimensions and constants
 # ======================================================================================
 M = 4096   # Rows in A and C
-K = 16  # Columns in A, Rows in B
+K = 4096  # Columns in A, Rows in B
 N = 4096   # Columns in B and C
 
 Mmma = 16
@@ -110,11 +110,11 @@ class Fragments:
 # (threadID_in_group * 2) + (i & 0x1) + 8      for ai where i >= 4
 
 # TODO: Clean up syntax to specify these
-a_locs = [('blockIdx.y', f'{(i//2%2)*Mmma//2}+(lane_id/4)', '0', f'{(i%2)+(i//4%2)*Kmma//2}+(lane_id%4)*2') for i in range(8)]
-a_frags = Fragments('A', StridedShape([TILES_M, Mmma, 1, K]), 'half', 2, 8, a_locs)
+a_locs = [('blockIdx.y', f'{(i//2%2)*Mmma//2}+(lane_id/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(lane_id%4)*2') for i in range(8)]
+a_frags = Fragments('A', StridedShape([TILES_M, Mmma, TILES_K, Kmma]), 'half', 2, 8, a_locs)
 
-b_locs = [('0', f'{(i%2)+(i//2)*Kmma//2}+(lane_id%4)*2', 'blockIdx.x', 'lane_id/4') for i in range(4)]
-b_frags = Fragments('B', StridedShape([1, K, TILES_N, Nmma]), 'half', 2, 4, b_locs)
+b_locs = [('i', f'{(i%2)+(i//2)*Kmma//2}+(lane_id%4)*2', 'blockIdx.x', 'lane_id/4') for i in range(4)]
+b_frags = Fragments('B', StridedShape([TILES_K, Kmma, TILES_N, Nmma]), 'half', 2, 4, b_locs)
 
 d_locs = [('blockIdx.y', f'{(i//2)*Mmma//2}+(lane_id/4)', 'blockIdx.x', f'{i%2}+(lane_id%4)*2') for i in range(4)]
 d_frags = Fragments('D', StridedShape([TILES_M, Mmma, TILES_N, Nmma]), 'float', 4, 4, d_locs)
@@ -123,24 +123,22 @@ d_frags = Fragments('D', StridedShape([TILES_M, Mmma, TILES_N, Nmma]), 'float', 
 # ======================================================================================
 # CUDA kernel for FP16 matrix multiplication with FP32 accumulation
 # ======================================================================================
-def code_load_v2(mat_frags):
+def code_decl(mat_frags, val=None):
   return f'''
-    {mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}] {{
-      {',\n      '.join((f'{mat_frags.name}[{loc}]' for i, loc in enumerate(mat_frags.locs)))}
-    }};
+    {mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}]{f" = {val}" if val is not None else ""};
     unsigned int* {mat_frags.name.lower()}_int = reinterpret_cast<unsigned int *>({mat_frags.name.lower()}_frag);
   '''
+def code_load_v2(mat_frags):
+  return '      '.join((f'{mat_frags.name.lower()}_frag[{i}] = {mat_frags.name}[{loc}];\n'
+      for i, loc in enumerate(mat_frags.locs)))
 
 code_exec = f'''
-    float c_frag[4] = {{0.f, 0.f, 0.f, 0.f}};
-    float d_frag[4];
     // --- MMA PTX ---
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%0,%1,%2,%3}},{{%4,%5,%6,%7}},{{%8,%9}},{{%10,%11,%12,%13}};\\n"
-        : "=f"(d_frag[0]), "=f"(d_frag[1]), "=f"(d_frag[2]), "=f"(d_frag[3])
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%0,%1,%2,%3}},{{%4,%5,%6,%7}},{{%8,%9}},{{%0,%1,%2,%3}};\\n"
+        : "+f"(d_frag[0]), "+f"(d_frag[1]), "+f"(d_frag[2]), "+f"(d_frag[3])
         : "r"(a_int[0]), "r"(a_int[1]), "r"(a_int[2]), "r"(a_int[3]),
-        "r"(b_int[0]), "r"(b_int[1]),
-        "f"(c_frag[0]), "f"(c_frag[1]), "f"(c_frag[2]), "f"(c_frag[3])
+        "r"(b_int[0]), "r"(b_int[1])
     );
 '''
 
@@ -153,9 +151,14 @@ code = f'''extern "C"
 __global__ void matmul_fp16_fp32(const half* A, const half* B, float* C, float* D) {{
     unsigned int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-    {code_load_v2(a_frags)}
-    {code_load_v2(b_frags)}
-    {code_exec}
+    {code_decl(a_frags)}
+    {code_decl(b_frags)}
+    {code_decl(d_frags, "{0.0f,0.0f,0.0f,0.0f}")}
+    for (int i = 0; i < {TILES_K}; ++i) {{
+      {code_load_v2(a_frags)}
+      {code_load_v2(b_frags)}
+      {code_exec}
+    }}
     {code_store_v2(d_frags)}
 }}
 '''
@@ -215,7 +218,7 @@ stream.sync()
 #print(d_host)
 
 # Verify results
-assert np.allclose(d_host, ref, atol=1e-2), "Pinned memory matmul verification failed"
+assert np.allclose(d_host, ref, atol=1e-1), "Pinned memory matmul verification failed"
 
 # Cleanup
 a_buf.close(stream)
