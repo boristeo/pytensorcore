@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import math
 import numpy as np
 np.set_printoptions(linewidth=9999999)
 from cuda.core.experimental import (
@@ -21,11 +22,18 @@ if np.__version__ < "2.1.0":
 # ======================================================================================
 # Matrix dimensions and constants
 # ======================================================================================
-M = 16   # Rows in A and C
+M = 4096   # Rows in A and C
 K = 16  # Columns in A, Rows in B
-N = 8   # Columns in B and C
+N = 4096   # Columns in B and C
+
+Mmma = 16
+Kmma = 16
+Nmma = 8
 BLOCK_SIZE = 32  # single warp
-BLOCK_SIZE = 32  # single warp
+TILES_M = int(math.ceil(M / Mmma)) 
+TILES_N = int(math.ceil(N / Nmma))
+TILES_K = int(math.ceil(K / Kmma))
+NBLOCKS = TILES_M * TILES_N * TILES_K
 
 # ======================================================================================
 # Fragment definitions
@@ -52,13 +60,13 @@ class Fragments:
 # (threadID_in_group * 2) + (i & 0x1) + 8      for ai where i >= 4
 
 # TODO: Clean up syntax to specify these
-a_locs = [(f'{(i//2%2)*M//2}+(lane_id/4)', f'{(i%2)+(i//4%2)*M//2}+(lane_id%4)*2') for i in range(8)]
+a_locs = [(f'{(i//2%2)*Mmma//2}+(lane_id/4)+blockIdx.y*{Mmma}', f'{(i%2)+(i//4%2)*Kmma//2}+(lane_id%4)*2') for i in range(8)]
 a_frags = Fragments('A', (M, K), 'half', 2, 8, a_locs)
 
-b_locs = [(f'{(i%2)+(i//2)*K//2}+(lane_id%4)*2', f'lane_id/4') for i in range(4)]
+b_locs = [(f'{(i%2)+(i//2)*Kmma//2}+(lane_id%4)*2', f'lane_id/4+blockIdx.x*{Nmma}') for i in range(4)]
 b_frags = Fragments('B', (K, N), 'half', 2, 4, b_locs)
 
-d_locs = [(f'{(i//2)*(M//2)}+(lane_id/4)', f'{i%2}+(lane_id%4)*2') for i in range(4)]
+d_locs = [(f'{(i//2)*Mmma//2}+(lane_id/4)+blockIdx.y*{Mmma}', f'{i%2}+(lane_id%4)*2+blockIdx.x*{Nmma}') for i in range(4)]
 d_frags = Fragments('D', (M, N), 'float', 4, 4, d_locs)
 
 
@@ -147,14 +155,14 @@ stream.sync()
 # ======================================================================================
 # Kernel launch
 # ======================================================================================
-grid = 1
+grid = (TILES_N, TILES_M)
 block = BLOCK_SIZE
 config = LaunchConfig(grid=grid, block=block)
 
 launch(stream, config, kernel, a_buf, b_buf, 0, d_buf)
 stream.sync()
 
-print(d_host)
+#print(d_host)
 
 # Verify results
 assert np.allclose(d_host, ref, atol=1e-2), "Pinned memory matmul verification failed"
