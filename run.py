@@ -39,14 +39,64 @@ NBLOCKS = TILES_M * TILES_N * TILES_K
 # Fragment definitions
 # ======================================================================================
 
+class StridedShape:
+  def __init__(self, shape, strides=None):
+    self.shape = list(shape)
+    if strides is None:
+      strides = []
+      acc = 1
+      for dim in shape[::-1]:
+        strides.insert(0, acc)
+        acc *= dim
+    self.strides = [0 if s == 1 else st for s, st in zip(shape, strides)]
+    assert len(shape) == len(strides)
+  def __repr__(self):
+    return f"StridedShape(shape={self.shape}, strides={self.strides})"
+  def reshape(self, newshape):
+    old_shape, old_strides, new_shape = list(self.shape), list(self.strides), list(newshape)
+    old_count = 1
+    for s in old_shape: old_count *= s
+    new_count = 1
+    for s in new_shape: new_count *= s
+    if old_count != new_count: raise ValueError("Incompatible reshape dimensions")
+    if old_count == 0:
+      elem_stride, newstrides, mul = 1, [], 1
+      for s in reversed(new_shape):
+        newstrides.insert(0, 0 if s == 1 else elem_stride * mul)
+        if s != 1: mul *= s
+      return StridedShape(new_shape, newstrides)
+    old_non1 = [i for i, s in enumerate(old_shape) if s != 1]
+    if not old_non1:
+      newstrides, mul = [0 if s == 1 else 1 for s in new_shape], 1
+      for i in range(len(new_shape)-1, -1, -1):
+        if new_shape[i] != 1:
+          newstrides[i] = mul
+          mul *= new_shape[i]
+      return StridedShape(new_shape, newstrides)
+    last_old = old_non1[-1]
+    base, mul = old_strides[last_old], 1
+    for k in range(last_old, -1, -1):
+      if old_shape[k] == 1: continue
+      expected = base * mul
+      if old_strides[k] != expected:
+        raise ValueError("Reshape would require copying data")
+      mul *= old_shape[k]
+    newstrides, mul = [None]*len(new_shape), 1
+    for i in range(len(new_shape)-1, -1, -1):
+      s = new_shape[i]
+      newstrides[i] = 0 if s == 1 else base * mul
+      if s != 1: mul *= s
+    return StridedShape(new_shape, newstrides)
+
 class Fragments:
   def __init__(self, name, lshape, dtype, esize, nregs, locs):
+    assert len(lshape.shape) == len(locs[0])
     self.name = name
     self.lshape = lshape
     self.dtype = dtype
     self.esize = esize
     self.nregs = nregs
-    self.locs = (f'({h})*{lshape[-1]}+({c})' for h, c in locs)
+    self.locs = ('+'.join(f'({loc})*{stride}' for loc, stride in zip(mdimloc, self.lshape.strides)) for mdimloc in locs)
 
 # Multiplicand A:
 #
@@ -60,14 +110,14 @@ class Fragments:
 # (threadID_in_group * 2) + (i & 0x1) + 8      for ai where i >= 4
 
 # TODO: Clean up syntax to specify these
-a_locs = [(f'{(i//2%2)*Mmma//2}+(lane_id/4)+blockIdx.y*{Mmma}', f'{(i%2)+(i//4%2)*Kmma//2}+(lane_id%4)*2') for i in range(8)]
-a_frags = Fragments('A', (M, K), 'half', 2, 8, a_locs)
+a_locs = [('blockIdx.y', f'{(i//2%2)*Mmma//2}+(lane_id/4)', '0', f'{(i%2)+(i//4%2)*Kmma//2}+(lane_id%4)*2') for i in range(8)]
+a_frags = Fragments('A', StridedShape([TILES_M, Mmma, 1, K]), 'half', 2, 8, a_locs)
 
-b_locs = [(f'{(i%2)+(i//2)*Kmma//2}+(lane_id%4)*2', f'lane_id/4+blockIdx.x*{Nmma}') for i in range(4)]
-b_frags = Fragments('B', (K, N), 'half', 2, 4, b_locs)
+b_locs = [('0', f'{(i%2)+(i//2)*Kmma//2}+(lane_id%4)*2', 'blockIdx.x', 'lane_id/4') for i in range(4)]
+b_frags = Fragments('B', StridedShape([1, K, TILES_N, Nmma]), 'half', 2, 4, b_locs)
 
-d_locs = [(f'{(i//2)*Mmma//2}+(lane_id/4)+blockIdx.y*{Mmma}', f'{i%2}+(lane_id%4)*2+blockIdx.x*{Nmma}') for i in range(4)]
-d_frags = Fragments('D', (M, N), 'float', 4, 4, d_locs)
+d_locs = [('blockIdx.y', f'{(i//2)*Mmma//2}+(lane_id/4)', 'blockIdx.x', f'{i%2}+(lane_id%4)*2') for i in range(4)]
+d_frags = Fragments('D', StridedShape([TILES_M, Mmma, TILES_N, Nmma]), 'float', 4, 4, d_locs)
 
 
 # ======================================================================================
