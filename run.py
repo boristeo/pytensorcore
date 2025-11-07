@@ -97,7 +97,18 @@ class Fragments:
   def linidx(self, lane, reg):
     return self.lanes.logical_to_real(lane) + self.regs.logical_to_real(reg)
 
-    
+
+a_locs = [(f'{(i//2%2)*M//2}+(lane_id/4)', f'{(i%2)+(i//4%2)*M//2}+(lane_id%4)*2') for i in range(8)]
+a_shape = (M, K)
+a_locs_flat = (f'({h})*{a_shape[-1]}+({c})' for h, c in a_locs)
+
+b_locs = [(f'{(i%2)+(i//2)*K//2}+(lane_id%4)*2', f'lane_id/4') for i in range(4)]
+b_shape = (K, N)
+b_locs_flat = (f'({h})*{b_shape[-1]}+({c})' for h, c in b_locs)
+
+d_locs = [(f'{(i//2)*(M//2)}+(lane_id/4)', f'{i%2}+(lane_id%4)*2') for i in range(4)]
+d_shape = (M, N)
+d_locs_flat = (f'({h})*{b_shape[-1]}+({c})' for h, c in d_locs)
 
 a_frags = Fragments('A', (M, K), 'half', 2, 8, [M//2, K//4, 2, 2, 2], [M, 2, K//2, M*K//2, 1])
 b_frags = Fragments('B', (K, N), 'half', 2, 4, [N, K//4, 2, 2], [1, 2*N, K*N//2, N])
@@ -114,6 +125,14 @@ def code_load(mat_frags):
     {'\n    '.join((
       f'{mat_frags.name.lower()}_frag[{i}] = {mat_frags.name}[{mat_frags.name.lower()}_lane_offset + {mat_frags.linidx(0, i)}];'
       for i in range(mat_frags.nregs)))}
+    unsigned int* {mat_frags.name.lower()}_int = reinterpret_cast<unsigned int *>({mat_frags.name.lower()}_frag);
+  '''
+
+def code_load_v2(locs, mat_frags):
+  return f'''
+    {mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}] {{
+      {',\n      '.join((f'{mat_frags.name}[{loc}]' for i, loc in enumerate(locs)))}
+    }};
     unsigned int* {mat_frags.name.lower()}_int = reinterpret_cast<unsigned int *>({mat_frags.name.lower()}_frag);
   '''
 
@@ -138,14 +157,20 @@ def code_store(mat_frags):
       for i in range(mat_frags.nregs)))}
   '''
 
+def code_store_v2(locs, mat_frags):
+  return f'''
+    unsigned int {mat_frags.name.lower()}_lane_offset = {mat_frags.lanes.export_c_expression("lane_id")};
+    {'\n    '.join((f'{mat_frags.name}[{loc}] = {mat_frags.name.lower()}_frag[{i}];' for i, loc in enumerate(locs)))}
+  '''
+
 code = f'''extern "C"
 __global__ void matmul_fp16_fp32(const half* A, const half* B, float* C, float* D) {{
     unsigned int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-    {code_load(a_frags)}
-    {code_load(b_frags)}
+    {code_load_v2(a_locs_flat, a_frags)}
+    {code_load_v2(b_locs_flat, b_frags)}
     {code_exec}
-    {code_store(d_frags)}
+    {code_store_v2(d_locs_flat, d_frags)}
 }}
 '''
 
