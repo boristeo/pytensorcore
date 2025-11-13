@@ -22,18 +22,6 @@ if np.__version__ < "2.1.0":
 # ======================================================================================
 # Matrix dimensions and constants
 # ======================================================================================
-M = 4096   # Rows in A and C
-K = 4096  # Columns in A, Rows in B
-N = 4096   # Columns in B and C
-
-Mmma = 16
-Kmma = 16
-Nmma = 8
-BLOCK_SIZE = 32  # single warp
-TILES_M = int(math.ceil(M / Mmma)) 
-TILES_N = int(math.ceil(N / Nmma))
-TILES_K = int(math.ceil(K / Kmma))
-NBLOCKS = TILES_M * TILES_N * TILES_K
 
 # ======================================================================================
 # Fragment definitions
@@ -97,6 +85,15 @@ class Fragments:
     self.esize = esize
     self.nregs = nregs
     self.locs = ('+'.join(f'({loc})*{stride}' for loc, stride in zip(mdimloc, self.lshape.strides)) for mdimloc in locs)
+  @property
+  def frag_name(self):
+    return f'{self.name.lower()}_frag'
+  @property
+  def int_name(self):
+    return f'{self.name.lower()}_int'
+  @property
+  def nint32(self):
+    return self.nregs // (4 // self.esize)
 
 # Multiplicand A:
 #
@@ -109,37 +106,56 @@ class Fragments:
 # col =  (threadID_in_group * 2) + (i & 0x1)          for ai where i <  4
 # (threadID_in_group * 2) + (i & 0x1) + 8      for ai where i >= 4
 
+#M, N, K = 4096, 4096, 4096
+M, N, K = 16, 8, 16
+
+A_shape = StridedShape([M, K])
+B_shape = StridedShape([K, N])
+C_shape = StridedShape([M, N])
+
+Mmma = 16
+Kmma = 16
+Nmma = 8
+
+BLOCK_SIZE = 32  # single warp
+TILES_M = int(math.ceil(M / Mmma)) 
+TILES_N = int(math.ceil(N / Nmma))
+TILES_K = int(math.ceil(K / Kmma))
+NBLOCKS = TILES_M * TILES_N * TILES_K
+
+
 # TODO: Clean up syntax to specify these
-a_locs = [('blockIdx.y', f'{(i//2%2)*Mmma//2}+(lane_id/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(lane_id%4)*2') for i in range(8)]
-a_frags = Fragments('A', StridedShape([TILES_M, Mmma, TILES_K, Kmma]), 'half', 2, 8, a_locs)
+a_locs = [('by', f'{(i//2%2)*Mmma//2}+(tid/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(tid%4)*2') for i in range(8)]
+a_frags = Fragments('A', A_shape.reshape([TILES_M, Mmma, TILES_K, Kmma]), 'half', 2, 8, a_locs)
 
-b_locs = [('i', f'{(i%2)+(i//2)*Kmma//2}+(lane_id%4)*2', 'blockIdx.x', 'lane_id/4') for i in range(4)]
-b_frags = Fragments('B', StridedShape([TILES_K, Kmma, TILES_N, Nmma]), 'half', 2, 4, b_locs)
+b_locs = [('i', f'{(i%2)+(i//2)*Kmma//2}+(tid%4)*2', 'bx', 'tid/4') for i in range(4)]
+b_frags = Fragments('B', B_shape.reshape([TILES_K, Kmma, TILES_N, Nmma]), 'half', 2, 4, b_locs)
 
-d_locs = [('blockIdx.y', f'{(i//2)*Mmma//2}+(lane_id/4)', 'blockIdx.x', f'{i%2}+(lane_id%4)*2') for i in range(4)]
-d_frags = Fragments('D', StridedShape([TILES_M, Mmma, TILES_N, Nmma]), 'float', 4, 4, d_locs)
+d_locs = [('by', f'{(i//2)*Mmma//2}+(tid/4)', 'bx', f'{i%2}+(tid%4)*2') for i in range(4)]
+d_frags = Fragments('D', C_shape.reshape([TILES_M, Mmma, TILES_N, Nmma]), 'float', 4, 4, d_locs)
 
 
 # ======================================================================================
 # CUDA kernel for FP16 matrix multiplication with FP32 accumulation
 # ======================================================================================
 def code_decl(mat_frags, val=None):
-  return f'''
-    {mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}]{f" = {val}" if val is not None else ""};
-    unsigned int* {mat_frags.name.lower()}_int = reinterpret_cast<unsigned int *>({mat_frags.name.lower()}_frag);
-  '''
+  return f'{mat_frags.dtype} {mat_frags.name.lower()}_frag[{mat_frags.nregs}]{f" = {val}" if val is not None else ""};'
 def code_load_v2(mat_frags):
   return '      '.join((f'{mat_frags.name.lower()}_frag[{i}] = {mat_frags.name}[{loc}];\n'
       for i, loc in enumerate(mat_frags.locs)))
 
-code_exec = f'''
-    // --- MMA PTX ---
-    asm volatile(
+def code_exec(a, b, c_d):
+  return f'''
+      // --- MMA PTX ---
+      unsigned int* {a.int_name} = reinterpret_cast<unsigned int *>({a.frag_name});
+      unsigned int* {b.int_name} = reinterpret_cast<unsigned int *>({b.frag_name});
+      unsigned int* {c_d.int_name} = reinterpret_cast<unsigned int *>({c_d.frag_name});
+      asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%0,%1,%2,%3}},{{%4,%5,%6,%7}},{{%8,%9}},{{%0,%1,%2,%3}};\\n"
-        : "+f"(d_frag[0]), "+f"(d_frag[1]), "+f"(d_frag[2]), "+f"(d_frag[3])
-        : "r"(a_int[0]), "r"(a_int[1]), "r"(a_int[2]), "r"(a_int[3]),
-        "r"(b_int[0]), "r"(b_int[1])
-    );
+        : {",".join(f"\"+r\"({c_d.int_name}[{i}])" for i in range(c_d.nint32))}
+        : {",".join(f"\"r\"({a.int_name}[{i}])" for i in range(a.nint32))}
+        , {",".join(f"\"r\"({b.int_name}[{i}])" for i in range(b.nint32))}
+      );
 '''
 
 def code_store_v2(mat_frags):
@@ -149,15 +165,18 @@ def code_store_v2(mat_frags):
 
 code = f'''extern "C"
 __global__ void matmul_fp16_fp32(const half* A, const half* B, float* C, float* D) {{
-    unsigned int lane_id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
+    unsigned int tid = threadIdx.x;
+    unsigned int bx = blockIdx.x;
+    unsigned int by = blockIdx.y;
+    unsigned int bz = blockIdx.z;
     {code_decl(a_frags)}
     {code_decl(b_frags)}
     {code_decl(d_frags, "{0.0f,0.0f,0.0f,0.0f}")}
+
     for (int i = 0; i < {TILES_K}; ++i) {{
       {code_load_v2(a_frags)}
       {code_load_v2(b_frags)}
-      {code_exec}
+      {code_exec(a_frags, b_frags, d_frags)}
     }}
     {code_store_v2(d_frags)}
 }}
@@ -209,7 +228,7 @@ stream.sync()
 # Kernel launch
 # ======================================================================================
 grid = (TILES_N, TILES_M)
-block = BLOCK_SIZE
+block = (BLOCK_SIZE, )
 config = LaunchConfig(grid=grid, block=block)
 
 launch(stream, config, kernel, a_buf, b_buf, 0, d_buf)
