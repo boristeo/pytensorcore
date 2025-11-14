@@ -125,16 +125,16 @@ TILES_N = int(math.ceil(N / Nmma))
 TILES_K = int(math.ceil(K / Kmma))
 NBLOCKS = TILES_M * TILES_N * TILES_K
 
-A_sbuf_shape = StridedShape([Mmma, Kmma])
-B_sbuf_shape = StridedShape([Kmma, Nmma])
+A_sbuf_shape = StridedShape([2, Mmma, Kmma])  # 2 for double buffering
+B_sbuf_shape = StridedShape([2, Kmma, Nmma])
 
 
 # TODO: Clean up syntax to specify these
-a_locs = [('by', f'{(i//2%2)*Mmma//2}+(tid/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(tid%4)*2') for i in range(8)]
-a_frags = Fragments('s_a', A_sbuf_shape.reshape([A_sbuf_shape[0]//Mmma, Mmma, A_sbuf_shape[1]//Kmma, Kmma]), 'half', 2, 8, a_locs)
+a_locs = [('i%2', 'by', f'{(i//2%2)*Mmma//2}+(tid/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(tid%4)*2') for i in range(8)]
+a_frags = Fragments('s_a', A_sbuf_shape.reshape([2, A_sbuf_shape[1]//Mmma, Mmma, A_sbuf_shape[2]//Kmma, Kmma]), 'half', 2, 8, a_locs)
 
-b_locs = [('i', f'{(i%2)+(i//2)*Kmma//2}+(tid%4)*2', 'bx', 'tid/4') for i in range(4)]
-b_frags = Fragments('s_b', B_sbuf_shape.reshape([B_sbuf_shape[0]//Kmma, Kmma, B_sbuf_shape[1]//Nmma, Nmma]), 'half', 2, 4, b_locs)
+b_locs = [('i%2', 'i', f'{(i%2)+(i//2)*Kmma//2}+(tid%4)*2', 'bx', 'tid/4') for i in range(4)]
+b_frags = Fragments('s_b', B_sbuf_shape.reshape([2, B_sbuf_shape[1]//Kmma, Kmma, B_sbuf_shape[2]//Nmma, Nmma]), 'half', 2, 4, b_locs)
 
 d_locs = [('by', f'{(i//2)*Mmma//2}+(tid/4)', 'bx', f'{i%2}+(tid%4)*2') for i in range(4)]
 d_frags = Fragments('d', C_shape.reshape([TILES_M, Mmma, TILES_N, Nmma]), 'float', 4, 4, d_locs)
@@ -193,17 +193,24 @@ __global__ void matmul_fp16_fp32(
   {code_decl(d_frags, "{0.0f,0.0f,0.0f,0.0f}")}
 
   // TODO: Next step - double buf pipeline
-  __shared__ half s_a[{Mmma*Kmma}];
-  __shared__ half s_b[{Kmma*Nmma}];
+  __shared__ half s_a[2*{Mmma*Kmma}];
+  __shared__ half s_b[2*{Kmma*Nmma}];
   int s_a_addr = __cvta_generic_to_shared(s_a);
   int s_b_addr = __cvta_generic_to_shared(s_b);
 
+  {code_async_load_g2s(s=f"s_a_addr+tid*8*sizeof(half)", g=f"&a[by*{Mmma*K}+0*{Kmma}+(tid/2)*{K}+(tid%2)*8]", nbytes=16)}
+  {code_async_load_g2s(s=f"s_b_addr+tid*4*sizeof(half)", g=f"&b[0*{Kmma*N}+bx*{Nmma}+(tid/2)*{N}+(tid%2)*4]", nbytes=8)}
+  {code_commit()}
+
   // Loop over TILES_K
   for (int i = 0; i < {TILES_K}; ++i) {{
-    {code_async_load_g2s(s="s_a_addr+tid*8*sizeof(half)", g=f"&a[by*{Mmma*K}+i*{Kmma}+(tid/2)*{K}+(tid%2)*8]", nbytes=16)}
-    {code_async_load_g2s(s="s_b_addr+tid*4*sizeof(half)", g=f"&b[i*{Kmma*N}+bx*{Nmma}+(tid/2)*{N}+(tid%2)*4]", nbytes=8)}
-    {code_commit()}
     {code_sync()}
+    if (i < {TILES_K} - 1) {{
+      int nexti = i+1;
+      {code_async_load_g2s(s=f"s_a_addr+(nexti%2*{Mmma*Kmma}+tid*8)*sizeof(half)", g=f"&a[by*{Mmma*K}+nexti*{Kmma}+(tid/2)*{K}+(tid%2)*8]", nbytes=16)}
+      {code_async_load_g2s(s=f"s_b_addr+(nexti%2*{Kmma*Nmma}+tid*4)*sizeof(half)", g=f"&b[nexti*{Kmma*N}+bx*{Nmma}+(tid/2)*{N}+(tid%2)*4]", nbytes=8)}
+    }}
+    {code_commit()}
     // Done loading tile
     {code_load_v2(a_frags)}
     {code_load_v2(b_frags)}
