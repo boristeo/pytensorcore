@@ -1,15 +1,21 @@
 # pytensorcore
 
-Recently decided that I want to get familiar with GPUs. Turns out my vague understanding of CUDA programming is not actually too relevant to the new, actually performant ways to do big matmuls.
+This is just an educational exercise for myself to understand what primitives make writing high performance CUDA kernels easier.
 
-Throughout the past decade of GPU development, it seems to me they've mainly been bolting specialized little hardware blocks to various locations on chip, and getting the advertised FLOPS relies on using these new blocks optimally.
+Some examples of this have been trending lately, and I realized I need to learn more about architectural details of GPUs to tell who is being smart about it.
 
-My goal is to start with the tensor cores. Try to get a nice, scalable way to run any size matrix multiply at close to the theoretical FLOPS. Here I'll assume nice memory layout, or maybe forget about global loads altogether.
+The goal is not to rely on builtin CUDA C++ functions that abstract away implementation details (like the actual tensor core dimensions, fragment loading, async data movements)
 
-Later, I will deal with memory access. From what I've read, I suspect people who actually write kernels for a living would start with this because for them, when the data's in the right place compute is trivial. For now I don't know what the access patterns are going to be yet, and I want to set up a good workflow to profile sufficiently intense compute so that bad scheduling visibly makes it run worse.
+Currently my approach is generating C++, since that is still best for variable declarations, indexing calculations, and control flow. Where applicable, I insert inline PTX.
 
+Ideally I'd like to approach some warp-level IR, that offers quick ways to change the distribution of work (compute and loading) across threads, while treating memory regions logically as arbitrary rank tensors, giving me flexibility to group elements regardless of physical layout.
+
+The same principles will apply for full models. I've seen how to optimize neural nets from the top level down. At this lower one it feels exactly the same.
 
 ## Next steps:
 
-- codegen fragment logic
-- support larger matrix by tiling MMAs
+- clean up syntax - make index generation also usable for raw pointers
+
+- better profiling. Nsight is not working great for me right now
+
+- implement more tricks from good handwritten kernels, find clean way to express them
