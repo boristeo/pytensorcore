@@ -145,25 +145,37 @@ class SymbolicVar:
   def __init__(self, expr):
     self.expr = expr if isinstance(expr, str) else str(expr)
   def __add__(self, other):
+    if other == 0: return SymbolicVar(self.expr)
+    elif self == 0: return SymbolicVar(other)
     other_expr = other.expr if isinstance(other, SymbolicVar) else str(other)
     return SymbolicVar(f"({self.expr}+{other_expr})")
   def __sub__(self, other):
+    if other == 0: return SymbolicVar(self.expr)
     other_expr = other.expr if isinstance(other, SymbolicVar) else str(other)
     return SymbolicVar(f"({self.expr}-{other_expr})")
   def __mul__(self, other):
+    if self == 0 or other == 0: return SymbolicVar('0')
     other_expr = other.expr if isinstance(other, SymbolicVar) else str(other)
     return SymbolicVar(f"({self.expr}*{other_expr})")
   def __floordiv__(self, other):
+    if self == 0: return SymbolicVar('0')
+    if other == 0: raise ValueError('Divide by zero')
     other_expr = other.expr if isinstance(other, SymbolicVar) else str(other)
     return SymbolicVar(f"({self.expr}/{other_expr})")
   def __mod__(self, other):
+    if self == 0: return SymbolicVar('0')
+    if other == 0: raise ValueError('Divide by zero')
     other_expr = other.expr if isinstance(other, SymbolicVar) else str(other)
     return SymbolicVar(f"({self.expr}%{other_expr})")
   def __pow__(self, other):
+    if other == 0: return SymbolicVar('1')
+    elif self == 0: return SymbolicVar('0')
     other_expr = other.expr if isinstance(other, SymbolicVar) else str(other)
     return SymbolicVar(f"({self.expr}**{other_expr})")
   def __repr__(self):
     return f"SymbolicVar(expr='{self.expr}')"
+  def __eq__(self, x):
+    return self.expr == SymbolicVar(x).expr
   def to_expr(self):
     return self.expr
 
@@ -223,32 +235,39 @@ class StridedIndexer:
     if not new_shape: return offset
     return StridedIndexer(StridedShape(new_shape, new_strides), offset)
 
-atile = StridedShape([16,16]).reshape([2, 8, 2, 4, 2]).permute([1, 3, 0, 2, 4])
-aindex = StridedIndexer(atile, 0)
 
-print(aindex[..., 1, 0, 1][0,0])
-print(aindex.flat[0])
-print(aindex.flat[1])
-print(aindex.flat[2])
-print(aindex.flat[3])
-print(aindex.flat[4])
-print(aindex.flat[5])
-print(aindex.flat[6])
-print(aindex.flat[7])
-print()
-print(aindex.flat[8+0])
-print(aindex.flat[8+1])
-print(aindex.flat[8+2])
-print(aindex.flat[8+3])
-print(aindex.flat[8+4])
-print(aindex.flat[8+5])
-print(aindex.flat[8+6])
-print(aindex.flat[8+7])
-print()
+if __name__ == '__main__':
+  atile = StridedShape([16,16]).reshape([2, 8, 2, 4, 2]).permute([1, 3, 0, 2, 4])
+  aindex = StridedIndexer(atile, 0)
+
+  print(aindex[..., 1, 0, 1][0,0])
+  print(aindex.flat[0])
+  print(aindex.flat[1])
+  print(aindex.flat[2])
+  print(aindex.flat[3])
+  print(aindex.flat[4])
+  print(aindex.flat[5])
+  print(aindex.flat[6])
+  print(aindex.flat[7])
+  print()
+  print(aindex.flat[8+0])
+  print(aindex.flat[8+1])
+  print(aindex.flat[8+2])
+  print(aindex.flat[8+3])
+  print(aindex.flat[8+4])
+  print(aindex.flat[8+5])
+  print(aindex.flat[8+6])
+  print(aindex.flat[8+7])
+  print()
 
 
-tid = SymbolicVar('tid')
+  tid = SymbolicVar('tid')
 
-print(aindex[tid//4, tid%4, 0, 0, 1])
-print(aindex[tid//4, tid%4, 0, 1, 0])
-print(aindex[tid//4, tid%4, 1, 0, 0])
+  print(aindex[tid//4, tid%4, 0, 0, 1])
+  print(aindex[tid//4, tid%4, 0, 1, 0])
+  print(aindex[tid//4, tid%4, 1, 0, 0])
+  print()
+
+  print(aindex[tid//4, tid%4].flat[0])
+  print(aindex[tid//4, tid%4].flat[1])
+  print(aindex[tid//4, tid%4].flat[2])

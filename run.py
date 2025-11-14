@@ -14,69 +14,12 @@ from cuda.core.experimental import (
 )
 from functools import reduce
 import operator
+from playground import *
 
 if np.__version__ < "2.1.0":
     print("This example requires NumPy 2.1.0 or later", file=sys.stderr)
     sys.exit(0)
 
-# ======================================================================================
-# Matrix dimensions and constants
-# ======================================================================================
-
-# ======================================================================================
-# Fragment definitions
-# ======================================================================================
-
-class StridedShape:
-  def __init__(self, shape, strides=None):
-    self.shape = list(shape)
-    if strides is None:
-      strides = []
-      acc = 1
-      for dim in shape[::-1]:
-        strides.insert(0, acc)
-        acc *= dim
-    self.strides = [0 if s == 1 else st for s, st in zip(shape, strides)]
-    assert len(shape) == len(strides)
-  def __getitem__(self, i):
-    return self.shape[i]
-  def __repr__(self):
-    return f"StridedShape(shape={self.shape}, strides={self.strides})"
-  def reshape(self, newshape):
-    old_shape, old_strides, new_shape = list(self.shape), list(self.strides), list(newshape)
-    old_count = 1
-    for s in old_shape: old_count *= s
-    new_count = 1
-    for s in new_shape: new_count *= s
-    if old_count != new_count: raise ValueError("Incompatible reshape dimensions")
-    if old_count == 0:
-      elem_stride, newstrides, mul = 1, [], 1
-      for s in reversed(new_shape):
-        newstrides.insert(0, 0 if s == 1 else elem_stride * mul)
-        if s != 1: mul *= s
-      return StridedShape(new_shape, newstrides)
-    old_non1 = [i for i, s in enumerate(old_shape) if s != 1]
-    if not old_non1:
-      newstrides, mul = [0 if s == 1 else 1 for s in new_shape], 1
-      for i in range(len(new_shape)-1, -1, -1):
-        if new_shape[i] != 1:
-          newstrides[i] = mul
-          mul *= new_shape[i]
-      return StridedShape(new_shape, newstrides)
-    last_old = old_non1[-1]
-    base, mul = old_strides[last_old], 1
-    for k in range(last_old, -1, -1):
-      if old_shape[k] == 1: continue
-      expected = base * mul
-      if old_strides[k] != expected:
-        raise ValueError("Reshape would require copying data")
-      mul *= old_shape[k]
-    newstrides, mul = [None]*len(new_shape), 1
-    for i in range(len(new_shape)-1, -1, -1):
-      s = new_shape[i]
-      newstrides[i] = 0 if s == 1 else base * mul
-      if s != 1: mul *= s
-    return StridedShape(new_shape, newstrides)
 
 class Fragments:
   def __init__(self, name, lshape, dtype, esize, nregs, locs):
@@ -104,66 +47,30 @@ class Tensor:
     self.shape = StridedShape(shape)
     self.dtype = dtype
   
+# ======================================================================================
+# Matrix dimensions and constants
+# ======================================================================================
 
 Mmma, Nmma, Kmma = 16, 8, 16
 
 M, N, K = 4096, 4096, 4096
 #M, N, K = 16, 8, 16
 
-# Variables
+# ======================================================================================
+# Variable definitions
+# ======================================================================================
 
-a_global = Tensor('a', [M, K], 'half')
-b_global = Tensor('b', [K, N], 'half')
-d_global = Tensor('d', [M, N], 'float')
+
+a_global = Tensor('g_a', [M, K], 'half')
+b_global = Tensor('g_b', [K, N], 'half')
+d_global = Tensor('g_d', [M, N], 'float')
 
 a_sbuf = Tensor('s_a', [2, Mmma, Kmma], 'half')
 b_sbuf = Tensor('s_b', [2, Kmma, Nmma], 'half')
 
-"""
-Layout of fragment registers for thread 0 in a 16x16 warp patch of A
-0 1 _ _ _ _ _ _ 2 3 _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-            ...
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-4 5 _ _ _ _ _ _ 6 7 _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-            ...
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-
-Layout of fragment registers for thread 1 in a 16x16 warp patch of A
-_ _ 0 1 _ _ _ _ _ _ 2 3 _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-            ...
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ 4 5 _ _ _ _ _ _ 6 7 _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-            ...
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-Layout of fragment registers for thread 4 in a 16x16 warp patch of A
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-0 1 _ _ _ _ _ _ 2 3 _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-            ...
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-4 5 _ _ _ _ _ _ 6 7 _ _ _ _ _ _
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-            ...
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-
-Interpreting patch as shape
-
-[2, 8, 2, 4, 2]
-
-"""
-
+a_reg = Tensor('r_a', [8], 'half')
+b_reg = Tensor('r_b', [4], 'half')
+d_reg = Tensor('r_d', [4], 'float')
 
 # TODO: Clean up syntax to specify these
 a_locs = [('i%2', 'by', f'{(i//2%2)*Mmma//2}+(tid/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(tid%4)*2') for i in range(8)]
@@ -239,9 +146,9 @@ __global__ void matmul_fp16_fp32(
   {code_commit()}
 
   // Loop over TILES_K
-  for (int i = 0; i < {TILES_K}; ++i) {{
+  for (int i = 0; i < {K//Kmma}; ++i) {{
     {code_sync()}
-    if (i < {TILES_K} - 1) {{
+    if (i < {K//Kmma} - 1) {{
       int nexti = i+1;
       {code_async_load_g2s(s=f"s_a_addr+(nexti%2*{Mmma*Kmma}+tid*8)*sizeof(half)", g=f"&a[by*{Mmma*K}+nexti*{Kmma}+(tid/2)*{K}+(tid%2)*8]", nbytes=16)}
       {code_async_load_g2s(s=f"s_b_addr+(nexti%2*{Kmma*Nmma}+tid*4)*sizeof(half)", g=f"&b[nexti*{Kmma*N}+bx*{Nmma}+(tid/2)*{N}+(tid%2)*4]", nbytes=8)}
