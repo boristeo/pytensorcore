@@ -86,17 +86,19 @@ which maps to lane 0-31
 
 class StridedShape:
   def __init__(self, shape, strides=None):
-    self.shape = list(shape)
-    if strides is None:
-      strides = []
-      acc = 1
-      for dim in shape[::-1]:
-        strides.insert(0, acc)
-        acc *= dim
-    self.strides = [0 if s == 1 else st for s, st in zip(shape, strides)]
-    assert len(shape) == len(strides)
-  def __getitem__(self, i):
-    return self.shape[i]
+    if isinstance(shape, StridedShape):
+      self.shape = shape.shape
+      self.strides = shape.strides
+    else:
+      self.shape = list(shape)
+      if strides is None:
+        strides = []
+        acc = 1
+        for dim in shape[::-1]:
+          strides.insert(0, acc)
+          acc *= dim
+      self.strides = [0 if s == 1 else st for s, st in zip(shape, strides)]
+      assert len(shape) == len(strides)
   def __repr__(self):
     return f"StridedShape(shape={self.shape}, strides={self.strides})"
   def reshape(self, newshape):
@@ -143,7 +145,7 @@ class StridedShape:
 
 class SymbolicVar:
   def __init__(self, expr):
-    self.expr = expr if isinstance(expr, str) else str(expr)
+    self.expr = expr.expr if isinstance(expr, SymbolicVar) else expr if isinstance(expr, str) else str(expr)
   def __add__(self, other):
     if other == 0: return SymbolicVar(self.expr)
     elif self == 0: return SymbolicVar(other)
@@ -176,16 +178,16 @@ class SymbolicVar:
     return f"SymbolicVar(expr='{self.expr}')"
   def __eq__(self, x):
     return self.expr == SymbolicVar(x).expr
-  def to_expr(self):
-    return self.expr
 
 class StridedIndexer:
   class FlatIndexer:
     def __init__(self, st):
       self.st = st
+      self.shape = st.shape.shape
     def __getitem__(self, i):
+      i = i[0] if getattr(i, '__getitem__', None) else i
       index = []
-      for dim in self.st.shape[::-1]:
+      for dim in self.st.shape.shape[::-1]:
         index.insert(0, i%dim)
         i //= dim
       return self.st[index]
@@ -214,7 +216,7 @@ class StridedIndexer:
     idx = self._expand_index(idx)
     offset, new_shape, new_strides = self.base_offset, [], []
     for dim in range(len(self.shape)):
-      i, dim_size, stride = idx[dim], self.shape[dim], self.shape.strides[dim]
+      i, dim_size, stride = idx[dim], self.shape.shape[dim], self.shape.strides[dim]
       if isinstance(i, SymbolicVar):
         if not isinstance(offset, SymbolicVar):
           offset = SymbolicVar(offset)
@@ -237,7 +239,7 @@ class StridedIndexer:
 
 
 if __name__ == '__main__':
-  atile = StridedShape([16,16]).reshape([2, 8, 2, 4, 2]).permute([1, 3, 0, 2, 4])
+  atile = StridedShape([16,16]).reshape([2, 8, 2, 4, 2]).permute([1, 3, 2, 0, 4])
   aindex = StridedIndexer(atile, 0)
 
   print(aindex[..., 1, 0, 1][0,0])
@@ -271,3 +273,13 @@ if __name__ == '__main__':
   print(aindex[tid//4, tid%4].flat[0])
   print(aindex[tid//4, tid%4].flat[1])
   print(aindex[tid//4, tid%4].flat[2])
+
+
+  btile = StridedShape([16,8]).reshape([2, 4, 2, 8]).permute([1, 3, 0, 2])
+  bindex = StridedIndexer(btile, 0)
+
+  print(bindex[tid%4,tid//4].flat[0])
+  print(bindex[tid%4,tid//4].flat[1])
+  print(bindex[tid%4,tid//4].flat[2])
+  print(bindex[tid%4,tid//4].flat[3])
+  print(bindex[tid%4,tid//4].flat[4])

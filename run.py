@@ -42,10 +42,25 @@ class Fragments:
 
 
 class Tensor:
-  def __init__(self, name, shape, dtype):
+  def __init__(self, name, shape, dtype, *, init=None, indexer=None):
     self.name = name
     self.shape = StridedShape(shape)
+    self.indexer = indexer or StridedIndexer(self.shape)
     self.dtype = dtype
+    self.init = np.ones(shape)*init if isinstance(init, int) else init
+  def reshape(self, *newshape):
+    if len(newshape) == 1: newshape = newshape[0]
+    return Tensor(self.name, self.shape.reshape(newshape), self.dtype)
+  def permute(self, *permutation):
+    if len(permutation) == 1: permutation = permutation[0]
+    return Tensor(self.name, self.shape.permute(permutation), self.dtype)
+  def flatten(self):
+    return Tensor(self.name, [np.prod(self.shape.shape)], self.dtype, indexer=self.indexer.flat)
+  def __getitem__(self, i):
+    indexer = self.indexer[i]
+    return Tensor(self.name, indexer.shape, self.dtype, indexer=indexer)
+  def index(self):
+    return self.indexer
   
 # ======================================================================================
 # Matrix dimensions and constants
@@ -54,12 +69,20 @@ class Tensor:
 Mmma, Nmma, Kmma = 16, 8, 16
 
 M, N, K = 4096, 4096, 4096
-#M, N, K = 16, 8, 16
+#M, N, K = 16, 8
 
 # ======================================================================================
 # Variable definitions
 # ======================================================================================
 
+l0 = SymbolicVar('tid')
+l1 = SymbolicVar('l1')
+l2 = SymbolicVar('l2')
+g0 = SymbolicVar('g0')
+g1 = SymbolicVar('g1')
+g2 = SymbolicVar('g2')
+
+i = SymbolicVar('i')
 
 a_global = Tensor('g_a', [M, K], 'half')
 b_global = Tensor('g_b', [K, N], 'half')
@@ -68,16 +91,19 @@ d_global = Tensor('g_d', [M, N], 'float')
 a_sbuf = Tensor('s_a', [2, Mmma, Kmma], 'half')
 b_sbuf = Tensor('s_b', [2, Kmma, Nmma], 'half')
 
-a_reg = Tensor('r_a', [8], 'half')
-b_reg = Tensor('r_b', [4], 'half')
-d_reg = Tensor('r_d', [4], 'float')
+a_sbuf_frag = a_sbuf.reshape(2, 2, 8, 2, 4, 2).permute(0, 2, 4, 3, 1, 5)[i%2, l0//4, l0%4].flatten()
+b_sbuf_frag = b_sbuf.reshape(2, 2, 4, 2, 8).permute(0, 2, 4, 1, 3)[i%2, l0%4, l0//4].flatten()
+
+a_reg = Tensor('s_a_frag', [8], 'half')  # r_a
+b_reg = Tensor('s_b_frag', [4], 'half')  # r_b
+d_reg = Tensor('d_frag', [4], 'float', init=0)  # r_d
 
 # TODO: Clean up syntax to specify these
 a_locs = [('i%2', 'by', f'{(i//2%2)*Mmma//2}+(tid/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(tid%4)*2') for i in range(8)]
-a_frags = Fragments('s_a', a_sbuf.shape.reshape([2, a_sbuf.shape[1]//Mmma, Mmma, a_sbuf.shape[2]//Kmma, Kmma]), 'half', 2, 8, a_locs)
+a_frags = Fragments('s_a', a_sbuf.shape.reshape([2, a_sbuf.shape.shape[1]//Mmma, Mmma, a_sbuf.shape.shape[2]//Kmma, Kmma]), 'half', 2, 8, a_locs)
 
 b_locs = [('i%2', 'i', f'{(i%2)+(i//2)*Kmma//2}+(tid%4)*2', 'bx', 'tid/4') for i in range(4)]
-b_frags = Fragments('s_b', b_sbuf.shape.reshape([2, b_sbuf.shape[1]//Kmma, Kmma, b_sbuf.shape[2]//Nmma, Nmma]), 'half', 2, 4, b_locs)
+b_frags = Fragments('s_b', b_sbuf.shape.reshape([2, b_sbuf.shape.shape[1]//Kmma, Kmma, b_sbuf.shape.shape[2]//Nmma, Nmma]), 'half', 2, 4, b_locs)
 
 d_locs = [('by', f'{(i//2)*Mmma//2}+(tid/4)', 'bx', f'{i%2}+(tid%4)*2') for i in range(4)]
 d_frags = Fragments('d', d_global.shape.reshape([M//Mmma, Mmma, N//Nmma, Nmma]), 'float', 4, 4, d_locs)
@@ -86,8 +112,28 @@ d_frags = Fragments('d', d_global.shape.reshape([M//Mmma, Mmma, N//Nmma, Nmma]),
 # ======================================================================================
 # CUDA kernel for FP16 matrix multiplication with FP32 accumulation
 # ======================================================================================
-def code_decl(var, val=None):
-  return f'{var.dtype} {var.frag_name}[{var.nregs}]{f" = {val}" if val is not None else ""};'
+def code_decl_v2(t):
+  if t.init is not None:
+    return f'{t.dtype} {t.name}{"".join(f"[{dim}]" for dim in t.shape.shape)} = {{{",".join(str(v) for v in t.init)}}};'
+  else:
+    return f'{t.dtype} {t.name}{"".join(f"[{dim}]" for dim in t.shape.shape)};'
+def code_assign(l, r):
+  init = []
+  if r is not None:
+    index = [0]*len(l.shape)
+    while True:
+      init.append(f'{l.name}{"".join(f"[{i}]" for i in index)} = {r.name}[{r.index()[*index].expr}];')
+      index[-1] += 1
+      for i in reversed(range(1, len(index))):
+        if index[i] >= l.shape.shape[i]:
+          index[i] = 0
+          index[i-1] += 1
+        else:
+          break
+      if index[0] >= l.shape.shape[0]:
+        break
+  return '\n    '.join(init)
+
 def code_load_v2(mat_frags):
   return '    '.join((f'{mat_frags.frag_name}[{i}] = {mat_frags.name}[{loc}];\n' for i, loc in enumerate(mat_frags.locs)))
 def code_store_v2(mat_frags):
@@ -131,9 +177,9 @@ __global__ void matmul_fp16_fp32(
   unsigned int bx = blockIdx.x;
   unsigned int by = blockIdx.y;
   unsigned int bz = blockIdx.z;
-  {code_decl(a_frags)}
-  {code_decl(b_frags)}
-  {code_decl(d_frags, "{0.0f,0.0f,0.0f,0.0f}")}
+  {code_decl_v2(a_reg)}
+  {code_decl_v2(b_reg)}
+  {code_decl_v2(d_reg)}
 
   // TODO: Next step - double buf pipeline
   __shared__ half s_a[2*{Mmma*Kmma}];
@@ -155,8 +201,8 @@ __global__ void matmul_fp16_fp32(
     }}
     {code_commit()}
     // Done loading tile
-    {code_load_v2(a_frags)}
-    {code_load_v2(b_frags)}
+    {code_assign(a_reg, a_sbuf_frag)}
+    {code_assign(b_reg, b_sbuf_frag)}
     {code_exec(a_frags, b_frags, d_frags)}
   }}
   {code_store_v2(d_frags)}
