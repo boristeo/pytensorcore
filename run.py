@@ -97,47 +97,83 @@ class Fragments:
   def nint32(self):
     return self.nregs // (4 // self.esize)
 
-# Multiplicand A:
-#
-# groupID           = %laneid >> 2
-# threadID_in_group = %laneid % 4
-# 
-# row =      groupID            for ai where  0 <= i < 2 || 4 <= i < 6
-#           groupID + 8         Otherwise
-# 
-# col =  (threadID_in_group * 2) + (i & 0x1)          for ai where i <  4
-# (threadID_in_group * 2) + (i & 0x1) + 8      for ai where i >= 4
+
+class Tensor:
+  def __init__(self, name, shape, dtype):
+    self.name = name
+    self.shape = StridedShape(shape)
+    self.dtype = dtype
+  
+
+Mmma, Nmma, Kmma = 16, 8, 16
 
 M, N, K = 4096, 4096, 4096
 #M, N, K = 16, 8, 16
 
-A_shape = StridedShape([M, K])
-B_shape = StridedShape([K, N])
-C_shape = StridedShape([M, N])
+# Variables
 
-Mmma = 16
-Kmma = 16
-Nmma = 8
+a_global = Tensor('a', [M, K], 'half')
+b_global = Tensor('b', [K, N], 'half')
+d_global = Tensor('d', [M, N], 'float')
 
-BLOCK_SIZE = 32  # single warp
-TILES_M = int(math.ceil(M / Mmma)) 
-TILES_N = int(math.ceil(N / Nmma))
-TILES_K = int(math.ceil(K / Kmma))
-NBLOCKS = TILES_M * TILES_N * TILES_K
+a_sbuf = Tensor('s_a', [2, Mmma, Kmma], 'half')
+b_sbuf = Tensor('s_b', [2, Kmma, Nmma], 'half')
 
-A_sbuf_shape = StridedShape([2, Mmma, Kmma])  # 2 for double buffering
-B_sbuf_shape = StridedShape([2, Kmma, Nmma])
+"""
+Layout of fragment registers for thread 0 in a 16x16 warp patch of A
+0 1 _ _ _ _ _ _ 2 3 _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+            ...
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+4 5 _ _ _ _ _ _ 6 7 _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+            ...
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+Layout of fragment registers for thread 1 in a 16x16 warp patch of A
+_ _ 0 1 _ _ _ _ _ _ 2 3 _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+            ...
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ 4 5 _ _ _ _ _ _ 6 7 _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+            ...
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+Layout of fragment registers for thread 4 in a 16x16 warp patch of A
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+0 1 _ _ _ _ _ _ 2 3 _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+            ...
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+4 5 _ _ _ _ _ _ 6 7 _ _ _ _ _ _
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+            ...
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+Interpreting patch as shape
+
+[2, 8, 2, 4, 2]
+
+"""
 
 
 # TODO: Clean up syntax to specify these
 a_locs = [('i%2', 'by', f'{(i//2%2)*Mmma//2}+(tid/4)', 'i', f'{(i%2)+(i//4%2)*Kmma//2}+(tid%4)*2') for i in range(8)]
-a_frags = Fragments('s_a', A_sbuf_shape.reshape([2, A_sbuf_shape[1]//Mmma, Mmma, A_sbuf_shape[2]//Kmma, Kmma]), 'half', 2, 8, a_locs)
+a_frags = Fragments('s_a', a_sbuf.shape.reshape([2, a_sbuf.shape[1]//Mmma, Mmma, a_sbuf.shape[2]//Kmma, Kmma]), 'half', 2, 8, a_locs)
 
 b_locs = [('i%2', 'i', f'{(i%2)+(i//2)*Kmma//2}+(tid%4)*2', 'bx', 'tid/4') for i in range(4)]
-b_frags = Fragments('s_b', B_sbuf_shape.reshape([2, B_sbuf_shape[1]//Kmma, Kmma, B_sbuf_shape[2]//Nmma, Nmma]), 'half', 2, 4, b_locs)
+b_frags = Fragments('s_b', b_sbuf.shape.reshape([2, b_sbuf.shape[1]//Kmma, Kmma, b_sbuf.shape[2]//Nmma, Nmma]), 'half', 2, 4, b_locs)
 
 d_locs = [('by', f'{(i//2)*Mmma//2}+(tid/4)', 'bx', f'{i%2}+(tid%4)*2') for i in range(4)]
-d_frags = Fragments('d', C_shape.reshape([TILES_M, Mmma, TILES_N, Nmma]), 'float', 4, 4, d_locs)
+d_frags = Fragments('d', d_global.shape.reshape([M//Mmma, Mmma, N//Nmma, Nmma]), 'float', 4, 4, d_locs)
 
 
 # ======================================================================================
@@ -265,8 +301,8 @@ stream.sync()
 # ======================================================================================
 # Kernel launch
 # ======================================================================================
-grid = (TILES_N, TILES_M)
-block = (BLOCK_SIZE, )
+grid = (N//Nmma, M//Mmma)
+block = (32, )
 config = LaunchConfig(grid=grid, block=block)
 
 launch(stream, config, kernel, a_buf, b_buf, 0, d_buf)
