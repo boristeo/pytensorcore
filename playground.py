@@ -179,6 +179,12 @@ class SymbolicVar:
   def __eq__(self, x):
     return self.expr == SymbolicVar(x).expr
 
+def expr(x):
+  if isinstance(x, SymbolicVar):
+    return x.expr
+  else:
+    return str(x)
+
 class StridedIndexer:
   class FlatIndexer:
     def __init__(self, st):
@@ -283,3 +289,18 @@ if __name__ == '__main__':
   print(bindex[tid%4,tid//4].flat[2])
   print(bindex[tid%4,tid//4].flat[3])
   print(bindex[tid%4,tid//4].flat[4])
+  print()
+
+  dtile = StridedShape([4096, 4096]).reshape([4096//16, 2, 8, 4096//8, 4, 2]).permute([0, 3, 2, 4, 1, 5])
+  dindex = StridedIndexer(dtile)
+
+  bx = SymbolicVar('bx')
+  by = SymbolicVar('by')
+
+  print(dindex[by, bx, tid//4, tid%4].flat[0].expr)
+  print(dindex[by, bx, tid//4, tid%4].flat[1].expr)
+  print(dindex[by, bx, tid//4, tid%4].flat[2].expr)
+  print(dindex[by, bx, tid//4, tid%4].flat[3].expr)
+  print(dindex[by, bx, tid//4, tid%4].flat[4].expr)
+  print()
+
