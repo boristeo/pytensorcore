@@ -21,26 +21,32 @@ if np.__version__ < "2.1.0":
     sys.exit(0)
 
 
-class Tensor:
-  def __init__(self, name, shape, dtype, *, init=None, indexer=None):
+class Array:
+  def __init__(self, name, shape, dtype, *, init=None, indexer=None, memory=''):
     self.name = name
     self.shape = StridedShape(shape)
     self.indexer = indexer or StridedIndexer(self.shape)
     self.dtype = dtype
+    self.memory = memory + ' '  # clean this up
     self.init = np.ones(shape)*init if isinstance(init, int) else init
   def reshape(self, *newshape):
     if len(newshape) == 1: newshape = newshape[0]
-    return Tensor(self.name, self.shape.reshape(newshape), self.dtype)
+    return Array(self.name, self.shape.reshape(newshape), self.dtype, memory=self.memory)
   def permute(self, *permutation):
     if len(permutation) == 1: permutation = permutation[0]
-    return Tensor(self.name, self.shape.permute(permutation), self.dtype)
+    return Array(self.name, self.shape.permute(permutation), self.dtype, memory=self.memory)
   def flatten(self):
-    return Tensor(self.name, [np.prod(self.shape.shape)], self.dtype, indexer=self.indexer.flat)
-  def __getitem__(self, i):
-    indexer = self.indexer[i]
-    return Tensor(self.name, indexer.shape, self.dtype, indexer=indexer)
+    return Array(self.name, [reduce(operator.mul, self.shape.shape, 1)], self.dtype, indexer=self.indexer.flat, memory=self.memory)
   def index(self):
     return self.indexer
+  def __getitem__(self, i):
+    indexer = self.indexer[i]
+    if isinstance(indexer, StridedIndexer) or isinstance(indexer, StridedIndexer.FlatIndexer):
+      return Array(self.name, indexer.shape, self.dtype, indexer=indexer, memory=self.memory)
+    else:
+      return indexer
+  def __repr__(self):
+    return f'Array(name={self.name}, shape={self.shape}, dtype={self.dtype}, indexer={self.indexer})'
   
 
 sizeof = {
@@ -69,23 +75,31 @@ g0 = SymbolicVar('bx')
 g1 = SymbolicVar('by')
 g2 = SymbolicVar('g2')
 
+# More specifically, this is a loop var
 i = SymbolicVar('i')
 
-a_global = Tensor('a', [M, K], 'half')
-b_global = Tensor('b', [K, N], 'half')
-d_global = Tensor('d', [M, N], 'float')
+a_global = Array('a', [M, K], 'half')
+b_global = Array('b', [K, N], 'half')
+d_global = Array('d', [M, N], 'float')
 
-a_sbuf = Tensor('s_a', [2, Mmma, Kmma], 'half')
-b_sbuf = Tensor('s_b', [2, Kmma, Nmma], 'half')
+a_global_tile = a_global.reshape(M//Mmma, Mmma, K//Kmma, 2, 8).permute(1, 3, 0, 2, 4)[l0//2, l0%2]
+b_global_tile = b_global.reshape(K//Kmma, Kmma, N//Nmma, 2, 4).permute(1, 3, 0, 2, 4)[l0//2, l0%2]
+print('a_global_tile =', a_global_tile)
+
+a_sbuf = Array('s_a', [2, Mmma, Kmma], 'half', memory='__shared__')
+b_sbuf = Array('s_b', [2, Kmma, Nmma], 'half', memory='__shared__')
+
+a_sbuf_tile = a_sbuf.reshape(2, Mmma, 2, 8).permute(1, 2, 0, 3)[l0//2,l0%2]
+b_sbuf_tile = b_sbuf.reshape(2, Mmma, 2, 4).permute(1, 2, 0, 3)[l0//2,l0%2]
 
 a_sbuf_frag = a_sbuf.reshape(2, 2, 8, 2, 4, 2).permute(0, 2, 4, 3, 1, 5)[i%2, l0//4, l0%4].flatten()
 b_sbuf_frag = b_sbuf.reshape(2, 2, 4, 2, 8).permute(0, 4, 2, 1, 3)[i%2, l0//4, l0%4].flatten()
 
 d_global_frag = d_global.reshape(M//Mmma, 2, 8, N//Nmma, 4, 2).permute(0, 3, 2, 4, 1, 5)[g1, g0, l0//4, l0%4].flatten()
 
-a_reg = Tensor('s_a_frag', [8], 'half')  # r_a
-b_reg = Tensor('s_b_frag', [4], 'half')  # r_b
-d_reg = Tensor('d_frag', [4], 'float', init=0)  # r_d
+a_reg = Array('s_a_frag', [8], 'half')  # r_a
+b_reg = Array('s_b_frag', [4], 'half')  # r_b
+d_reg = Array('d_frag', [4], 'float', init=0)  # r_d
 
 
 # ======================================================================================
@@ -93,7 +107,7 @@ d_reg = Tensor('d_frag', [4], 'float', init=0)  # r_d
 # ======================================================================================
 def code_decl_v2(t):
   if t.init is not None:
-    return f'{t.dtype} {t.name}{"".join(f"[{dim}]" for dim in t.shape.shape)} = {{{",".join(str(v) for v in t.init)}}};'
+    return f'{t.memory}{t.dtype} {t.name}{"".join(f"[{dim}]" for dim in t.shape.shape)} = {{{",".join(str(v) for v in t.init)}}};'
   else:
     return f'{t.dtype} {t.name}{"".join(f"[{dim}]" for dim in t.shape.shape)};'
 def code_assign(l, r):
@@ -113,10 +127,6 @@ def code_assign(l, r):
         break
   return '\n    '.join(init)
 
-def code_load_v2(mat_frags):
-  return '    '.join((f'{mat_frags.frag_name}[{i}] = {mat_frags.name}[{loc}];\n' for i, loc in enumerate(mat_frags.locs)))
-def code_store_v2(mat_frags):
-  return '\n  '.join((f'{mat_frags.name}[{loc}] = {mat_frags.frag_name}[{i}];' for i, loc in enumerate(mat_frags.locs)))
 def code_exec(a, b, c_d):
   return f'''
     // --- MMA PTX ---
@@ -129,12 +139,17 @@ def code_exec(a, b, c_d):
       : {",".join(f"\"r\"({a.name}_int[{i}])" for i in range(a.shape.shape[0]//(4//sizeof[a.dtype])))}
       , {",".join(f"\"r\"({b.name}_int[{i}])" for i in range(b.shape.shape[0]//(4//sizeof[b.dtype])))}
     );'''
-def code_async_load_g2s(*, g, s, nbytes):
+def code_async_load_g2s(*, g, s):
+  print(g, g.shape, g.indexer)
+  #print(s, s.shape, s.indexer)
+  print(g[0])
+
+
+  nbytes = g.shape.shape[0] * sizeof[g.dtype]
   return f'''
-    asm volatile("cp.async.ca.shared.global [%0],[%1],{nbytes};\\n"
-      :
-      : "r"((int)({s}))
-      , "l"({g})
+    asm volatile("cp.async.ca.shared.global [%0],[%1],{nbytes};\\n":
+      : "r"((int)({s.name}_addr+({expr(s[0])})*sizeof({s.dtype})))
+      , "l"({g.name}+{expr(g[0])})
     );'''
 def code_commit():
     return 'asm volatile("cp.async.commit_group;\\n" ::);'
@@ -166,17 +181,16 @@ __global__ void matmul_fp16_fp32(
   int s_a_addr = __cvta_generic_to_shared(s_a);
   int s_b_addr = __cvta_generic_to_shared(s_b);
 
-  {code_async_load_g2s(s=f"s_a_addr+tid*8*sizeof(half)", g=f"&a[by*{Mmma*K}+0*{Kmma}+(tid/2)*{K}+(tid%2)*8]", nbytes=16)}
-  {code_async_load_g2s(s=f"s_b_addr+tid*4*sizeof(half)", g=f"&b[0*{Kmma*N}+bx*{Nmma}+(tid/2)*{N}+(tid%2)*4]", nbytes=8)}
+  {code_async_load_g2s(s=a_sbuf_tile[0].flatten(), g=a_global_tile[g1,0].flatten())}
+  {code_async_load_g2s(s=b_sbuf_tile[0].flatten(), g=b_global_tile[0,g0].flatten())}
   {code_commit()}
 
   // Loop over TILES_K
   for (int i = 0; i < {K//Kmma}; ++i) {{
     {code_sync()}
     if (i < {K//Kmma} - 1) {{
-      int nexti = i+1;
-      {code_async_load_g2s(s=f"s_a_addr+(nexti%2*{Mmma*Kmma}+tid*8)*sizeof(half)", g=f"&a[by*{Mmma*K}+nexti*{Kmma}+(tid/2)*{K}+(tid%2)*8]", nbytes=16)}
-      {code_async_load_g2s(s=f"s_b_addr+(nexti%2*{Kmma*Nmma}+tid*4)*sizeof(half)", g=f"&b[nexti*{Kmma*N}+bx*{Nmma}+(tid/2)*{N}+(tid%2)*4]", nbytes=8)}
+      {code_async_load_g2s(s=a_sbuf_tile[(i+1)%2].flatten(), g=a_global_tile[g1,i+1].flatten())}
+      {code_async_load_g2s(s=b_sbuf_tile[(i+2)%2].flatten(), g=b_global_tile[i+1,g0].flatten())}
     }}
     {code_commit()}
     // Done loading tile

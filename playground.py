@@ -197,6 +197,8 @@ class StridedIndexer:
         index.insert(0, i%dim)
         i //= dim
       return self.st[index]
+    def __repr__(self):
+      return f'FlatIndexer(shape={self.shape})'
   def __init__(self, shape:StridedShape, base_offset=0):
     assert isinstance(shape, StridedShape)
     self.shape = shape
@@ -242,6 +244,8 @@ class StridedIndexer:
         offset += i * stride
     if not new_shape: return offset
     return StridedIndexer(StridedShape(new_shape, new_strides), offset)
+  def __repr__(self):
+    return f'StridedIndexer(shape={self.shape}, base={self.base_offset})'
 
 
 if __name__ == '__main__':
