@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import tempfile
 import math
 import numpy as np
 np.set_printoptions(linewidth=9999999)
@@ -84,13 +85,12 @@ d_global = Array('d', [M, N], 'float')
 
 a_global_tile = a_global.reshape(M//Mmma, Mmma, K//Kmma, 2, 8).permute(1, 3, 0, 2, 4)[l0//2, l0%2]
 b_global_tile = b_global.reshape(K//Kmma, Kmma, N//Nmma, 2, 4).permute(1, 3, 0, 2, 4)[l0//2, l0%2]
-print('a_global_tile =', a_global_tile)
 
 a_sbuf = Array('s_a', [2, Mmma, Kmma], 'half', memory='__shared__')
 b_sbuf = Array('s_b', [2, Kmma, Nmma], 'half', memory='__shared__')
 
-a_sbuf_tile = a_sbuf.reshape(2, Mmma, 2, 8).permute(1, 2, 0, 3)[l0//2,l0%2]
-b_sbuf_tile = b_sbuf.reshape(2, Mmma, 2, 4).permute(1, 2, 0, 3)[l0//2,l0%2]
+a_sbuf_tile = a_sbuf.reshape(2, Mmma, 2, 8).reshape(2, 32, 8).permute(1, 0, 2)[l0]
+b_sbuf_tile = b_sbuf.reshape(2, Mmma, 2, 4).reshape(2, 32, 4).permute(1, 0, 2)[l0]
 
 a_sbuf_frag = a_sbuf.reshape(2, 2, 8, 2, 4, 2).permute(0, 2, 4, 3, 1, 5)[i%2, l0//4, l0%4].flatten()
 b_sbuf_frag = b_sbuf.reshape(2, 2, 4, 2, 8).permute(0, 4, 2, 1, 3)[i%2, l0//4, l0%4].flatten()
@@ -140,16 +140,11 @@ def code_exec(a, b, c_d):
       , {",".join(f"\"r\"({b.name}_int[{i}])" for i in range(b.shape.shape[0]//(4//sizeof[b.dtype])))}
     );'''
 def code_async_load_g2s(*, g, s):
-  print(g, g.shape, g.indexer)
-  #print(s, s.shape, s.indexer)
-  print(g[0])
-
-
   nbytes = g.shape.shape[0] * sizeof[g.dtype]
   return f'''
     asm volatile("cp.async.ca.shared.global [%0],[%1],{nbytes};\\n":
       : "r"((int)({s.name}_addr+({expr(s[0])})*sizeof({s.dtype})))
-      , "l"({g.name}+{expr(g[0])})
+      , "l"(&{g.name}[{expr(g[0])}])
     );'''
 def code_commit():
     return 'asm volatile("cp.async.commit_group;\\n" ::);'
@@ -188,9 +183,9 @@ __global__ void matmul_fp16_fp32(
   // Loop over TILES_K
   for (int i = 0; i < {K//Kmma}; ++i) {{
     {code_sync()}
-    if (i < {K//Kmma} - 1) {{
+    if (i < {K//Kmma-1}) {{
       {code_async_load_g2s(s=a_sbuf_tile[(i+1)%2].flatten(), g=a_global_tile[g1,i+1].flatten())}
-      {code_async_load_g2s(s=b_sbuf_tile[(i+2)%2].flatten(), g=b_global_tile[i+1,g0].flatten())}
+      {code_async_load_g2s(s=b_sbuf_tile[(i+1)%2].flatten(), g=b_global_tile[i+1,g0].flatten())}
     }}
     {code_commit()}
     // Done loading tile
@@ -202,68 +197,79 @@ __global__ void matmul_fp16_fp32(
 }}
 '''
 
-print(code)
+#print(code)
 
 # ======================================================================================
 # CUDA setup
 # ======================================================================================
-dev = Device()
+dev = Device(0)
 dev.set_current()
 stream = dev.create_stream()
 
-program_options = ProgramOptions(std="c++20", arch=f"sm_{dev.arch}", pre_include='/usr/local/cuda/include/cuda_fp16.h')
-prog = Program(code, code_type="c++", options=program_options)
-mod = prog.compile("cubin")
-kernel = mod.get_kernel("matmul_fp16_fp32")
+with tempfile.NamedTemporaryFile(mode='w+b', prefix='', suffix='.generated.cu', dir='.') as f:
+  f.write(code.encode('utf-8'))
+  f.flush()
+  program_options = ProgramOptions(
+    name=f.name,
+    std="c++20",
+    arch=f"sm_{dev.arch}",
+    pre_include='/usr/local/cuda/include/cuda_fp16.h',
+    debug=False,
+    lineinfo=True,
+    device_code_optimize=True
+  )
+  prog = Program(code, code_type="c++", options=program_options)
+  mod = prog.compile("cubin")
+  kernel = mod.get_kernel("matmul_fp16_fp32")
 
-# Use pinned memory
-pinned_mr = LegacyPinnedMemoryResource()
+  # Use pinned memory
+  pinned_mr = LegacyPinnedMemoryResource()
 
-# Allocate matrices in pinned (CPU) memory
-a_bytes = M * K * np.dtype(np.float16).itemsize
-b_bytes = K * N * np.dtype(np.float16).itemsize
-d_bytes = M * N * np.dtype(np.float32).itemsize
+  # Allocate matrices in pinned (CPU) memory
+  a_bytes = M * K * np.dtype(np.float16).itemsize
+  b_bytes = K * N * np.dtype(np.float16).itemsize
+  d_bytes = M * N * np.dtype(np.float32).itemsize
 
-a_buf = pinned_mr.allocate(a_bytes, stream=stream)
-b_buf = pinned_mr.allocate(b_bytes, stream=stream)
-d_buf = pinned_mr.allocate(d_bytes, stream=stream)
+  a_buf = pinned_mr.allocate(a_bytes, stream=stream)
+  b_buf = pinned_mr.allocate(b_bytes, stream=stream)
+  d_buf = pinned_mr.allocate(d_bytes, stream=stream)
 
-# Convert to NumPy arrays using DLPack
-a_host = np.from_dlpack(a_buf).view(np.float16).reshape(M, K)
-b_host = np.from_dlpack(b_buf).view(np.float16).reshape(K, N)
-d_host = np.from_dlpack(d_buf).view(np.float32).reshape(M, N)
+  # Convert to NumPy arrays using DLPack
+  a_host = np.from_dlpack(a_buf).view(np.float16).reshape(M, K)
+  b_host = np.from_dlpack(b_buf).view(np.float16).reshape(K, N)
+  d_host = np.from_dlpack(d_buf).view(np.float32).reshape(M, N)
 
-# Initialize inputs
-rng = np.random.default_rng()
-a_host[:] = rng.random((M, K), dtype=np.float32)
-b_host[:] = rng.random((K, N), dtype=np.float32)
-d_host[:] = 0
+  # Initialize inputs
+  rng = np.random.default_rng()
+  a_host[:] = rng.random((M, K), dtype=np.float32)
+  b_host[:] = rng.random((K, N), dtype=np.float32)
+  d_host[:] = 0
 
-# Keep reference for correctness check
-ref = np.matmul(a_host.astype(np.float32), b_host.astype(np.float32))
+  # Keep reference for correctness check
+  ref = np.matmul(a_host.astype(np.float32), b_host.astype(np.float32))
 
-stream.sync()
+  stream.sync()
 
-# ======================================================================================
-# Kernel launch
-# ======================================================================================
-grid = (N//Nmma, M//Mmma)
-block = (32, )
-config = LaunchConfig(grid=grid, block=block)
+  # ======================================================================================
+  # Kernel launch
+  # ======================================================================================
+  grid = (N//Nmma, M//Mmma)
+  block = (32, )
+  config = LaunchConfig(grid=grid, block=block)
 
-launch(stream, config, kernel, a_buf, b_buf, 0, d_buf)
-stream.sync()
+  launch(stream, config, kernel, a_buf, b_buf, 0, d_buf)
+  stream.sync()
 
-#print(d_host)
+  #print(d_host)
 
-# Verify results
-assert np.allclose(d_host, ref, atol=1e-1), "Pinned memory matmul verification failed"
+  # Verify results
+  assert np.allclose(d_host, ref, atol=1e-1), "Pinned memory matmul verification failed"
 
-# Cleanup
-a_buf.close(stream)
-b_buf.close(stream)
-d_buf.close(stream)
-stream.close()
+  # Cleanup
+  a_buf.close(stream)
+  b_buf.close(stream)
+  d_buf.close(stream)
+  stream.close()
 
-print("Pinned memory FP16×FP16→FP32 matrix multiplication example completed successfully!")
+  print("Pinned memory FP16×FP16→FP32 matrix multiplication example completed successfully!", file=sys.stderr)
 
